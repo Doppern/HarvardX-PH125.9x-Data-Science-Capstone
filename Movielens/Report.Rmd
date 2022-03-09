@@ -1,0 +1,1136 @@
+---
+title: "Report - Movielens Project"
+output:
+  pdf_document: default
+    # toc: true
+  html_document: default
+---
+
+```{r load-packages, include=FALSE}
+# Install required packages if missing
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(ggthemes)) install.packages("ggthemes", repos = "http://cran.us.r-project.org")
+if(!require(scales)) install.packages("scales", repos = "http://cran.us.r-project.org")
+if(!require(patchwork)) install.packages("patchwork", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+if(!require(data.table)) install.packages("data.table", repos = "http://cran.us.r-project.org")
+if(!require(lubridate)) install.packages("lubridate", repos = "http://cran.us.r-project.org")
+if(!require(Matrix)) install.packages("Matrix", repos = "http://cran.us.r-project.org")
+if(!require(recosystem)) install.packages("recosystem", repos = "http://cran.us.r-project.org")
+if(!require(parallel)) install.packages("parallel", repos = "http://cran.us.r-project.org")
+if(!require(knitr)) install.packages("knitr", repos = "http://cran.us.r-project.org")
+if(!require(systemfonts)) install.packages("systemfonts", repos = "http://cran.us.r-project.org")
+if(!require(kableExtra)) install.packages("kableExtra", repos = "http://cran.us.r-project.org")
+
+# Load required packages
+library(tidyverse)
+library(ggthemes)
+library(scales)
+library(patchwork)
+library(caret)
+library(data.table)
+library(lubridate)
+library(Matrix)
+library(recosystem)
+library(parallel)
+library(knitr)
+library(systemfonts)
+library(kableExtra)
+
+theme_set(theme_economist_white(gray_bg = F
+                                , base_family = "Verdana") +
+            theme(axis.title = element_text(margin = margin(t = 10
+                                                            , r = 10
+                                                            , b = 10
+                                                            , l = 10)
+                                            )
+                  )
+          )
+```
+
+```{r script.r, eval=FALSE, cache=TRUE, include=FALSE}
+# Target measure
+target_rmse <- 0.86490
+
+# Set default ggplot theme
+# theme_set(theme_wsj() %+replace%
+#             theme(plot.background = element_rect(fill = "white")
+#                   , panel.background = element_rect(fill = "white")
+#                   )
+#           )
+theme_set(theme_economist_white(gray_bg = F
+                                , base_family = "Verdana") +
+            theme(axis.title = element_text(margin = margin(t = 10
+                                                            , r = 10
+                                                            , b = 10
+                                                            , l = 10)
+                                            )
+                  )
+          )
+
+# Reload the data from saved file so I can restart R without having to re-run the whole data script
+edx <- readRDS("edx.rds")
+validation <- readRDS("validation.rds")
+
+# Create sequential user and movie IDs to avoid having non-existent entries later
+user_ids <- edx[, .(UID = unique(userId) # Included to not have odd column names
+                    )
+                , keyby = .(userId) # Sort userId ascending and have only unique values
+                ] [, .(userId
+                       , UID = seq_len(.N) # Create sequential numbers for new UID
+                       )
+                   ]
+movie_ids <- edx[, .(MID = unique(movieId)
+                     )
+                 , keyby = .(movieId)
+                 ] [, .(movieId
+                        , MID = seq_len(.N)
+                        )
+                    ]
+edx <- merge.data.table(user_ids, edx, by = "userId")
+edx <- merge.data.table(movie_ids, edx, by = "movieId")
+validation <- merge.data.table(user_ids, validation, by = "userId")
+validation <- merge.data.table(movie_ids, validation, by = "movieId")
+rm(user_ids, movie_ids)
+
+# Update rating timestamp columns to be correct format for calculations
+edx[, timestamp := as_datetime(timestamp)]
+validation[, timestamp := as_datetime(timestamp)]
+
+# Add rating week identifier
+edx[, week := paste0(year(timestamp), week(timestamp))]
+validation[, week := paste0(year(timestamp), week(timestamp))]
+
+# Add movie release year
+edx[, release_year := as.integer(str_match(title, "\\((\\d{4})\\)$")[,2])]
+validation[, release_year := as.integer(str_match(title, "\\((\\d{4})\\)$")[,2])]
+
+# Add years between review and release
+edx[, years_passed := year(timestamp) - release_year]
+validation[, years_passed := year(timestamp) - release_year]
+
+# Useful counts to have
+n_users <- edx[, length(unique(UID))]
+n_movies <- edx[, length(unique(MID))]
+
+# Sparsity of ratings is the number of ratings in the dataset divided by number of possible ratings (users times movies)
+sparsity <- edx[, .N] / (n_users * n_movies)
+
+# How ratings are distributed between the different rating options
+distribution_ratings <-
+  edx[, .(rating = as.factor(rating))] %>%
+  ggplot(aes(x = rating)) +
+  geom_bar(stat = "count") +
+  scale_y_continuous(labels = function(x) x / 1e6
+                     , breaks = breaks_width(1e6)
+                     , minor_breaks = breaks_width(1e6 / 5)
+                     ) +
+  labs(title = "Distribution of ratings"
+       , x = "Rating"
+       , y = "Count of ratings in millions"
+       ) +
+  theme(panel.grid.minor.y = element_line(colour = "grey"
+                                          , linetype = "dotted")
+        )
+
+# Provide a uniform style for tables throughout the document with an option for min digits
+table_style <- function(table, min_two = F, results = F) {
+  table %>%
+    kbl(digits = if (results) {
+      4
+      } else {
+        2
+        }
+      , format.args = if (min_two) {
+      list(big.mark = ","
+           , nsmall = 2
+           )
+      } else {
+        list(big.mark = ",")
+        }
+    ) %>%
+    kable_styling("striped"
+                  , latex_options = c("HOLD_position"
+                                      , "striped"
+                                      )
+                  ) %>%
+    row_spec(0, bold = T)
+}
+
+top_5_movies <- edx[, .(Rating = mean(rating)
+                        , Reviews = .N
+                        )
+                    , by = .(Title = title)
+                    ] [Reviews >= 10
+                       ] [order(desc(Rating))
+                          ] %>% top_n(5, Rating)
+
+bottom_5_movies <- edx[, .(Rating = mean(rating)
+                           , Reviews = .N
+                           )
+                       , by = .(Title = title)
+                       ] [Reviews >= 10
+                          ] [order(desc(Rating))
+                             ] %>% top_n(-5, Rating)
+
+top_5_users <- edx[, .(Rating = mean(rating)
+                       , Reviews = .N
+                       )
+                   , by = .(User = UID)
+                   ] [order(desc(Rating))
+                      ] %>% top_n(5, Rating)
+
+bottom_5_users <- edx[, .(Rating = mean(rating)
+                          , Reviews = .N
+                          )
+                      , by = .(User = UID)
+                      ] [order(desc(Rating))
+                         ] %>% top_n(-5, Rating)
+
+
+
+# Does movies with more ratings get higher ratings?
+effect_of_number_of_ratings_per_movie <-
+  edx[, .(rating = mean(rating)
+          , num_rating = .N
+          , rating_group = (.N %/% 50) # calculate number of ratings integer divided by 50 for grouping
+          )
+      , by = .(MID) 
+      ] [, .(rating = sum(rating * num_rating) /
+               sum(num_rating)
+             )
+         , by = .(rating_group)
+         ] %>%
+  ggplot(aes(x = rating_group
+             , y = rating)) +
+  geom_point() +
+  geom_smooth(method = "loess"
+              , formula = "y ~ x") +
+  scale_x_continuous(name = "Number of reviews"
+                     , labels = function(x) format(x * 50, big.mark = ",")
+                     , breaks = breaks_width(10000 / 50)
+                     ) +
+  scale_y_continuous(name = "Average Rating"
+                     , limits = c(0, 5)) +
+  ggtitle("Movies")
+
+# Does users with higher number of ratings give higher ratings?
+effect_of_number_of_ratings_per_user <-
+  edx[, .(rating = mean(rating)
+          , num_rating = .N
+          , rating_group = (.N %/% 50)
+          )
+      , by = .(UID)
+      ] [, .(rating = sum(rating * num_rating) /
+               sum(num_rating)
+             )
+         , by = .(rating_group)
+         ] %>%
+  ggplot(aes(x = rating_group
+             , y = rating)) +
+  geom_point() +
+  geom_smooth(method = "loess"
+              , formula = "y ~ x") +
+  scale_x_continuous(name = "Number of reviews"
+                     , labels = function(x) format(x * 50, big.mark = ",")
+                     , breaks = breaks_width(1500 / 50)
+                     ) +
+  scale_y_continuous(name = "Average Rating"
+                     , limits = c(0, 5)) +
+  ggtitle("Users")
+
+# Does the genre of a movie affect it's average rating?
+effect_of_genre_on_ratings <- edx[, .(Rating = mean(rating)
+                                      , num_ratings = .N
+                                      )
+                                  , keyby = .(genres
+                                              )
+                                  ] %>%
+  ggplot(aes(x = reorder(genres
+                         , Rating
+                         )
+             , y = Rating
+             )
+         ) +#, size = num_ratings)) +
+  geom_col() +
+  labs(y = "Rating"
+       , x = "Genre"
+       , title = "Genre effect on rating"
+       ) +
+  scale_x_discrete(labels = c("Drama", "Comedy", "Romance", "War", "Documentary", "Horror", "Action", "Animation", "Mystery", "Thriller", "Comedy|Romance", "Documentary|Horror", "Animation|IMAX|Sci-Fi")
+                   , breaks = c("Drama", "Comedy", "Romance", "War", "Documentary", "Horror", "Action", "Animation", "Mystery", "Thriller", "Comedy|Romance", "Documentary|Horror", "Animation|IMAX|Sci-Fi")
+                   ) +
+  theme(axis.text.x = element_text(angle = 90
+                                   , vjust = 1
+                                   , hjust = 1
+                                   , size = 9
+                                   # , lineheight = 15
+                                   )
+        )
+
+# Add season based on month
+edx[, season := factor(case_when(month(timestamp) %in% 1:3 ~ "Winter"
+                                 , month(timestamp) %in% 4:6 ~ "Spring"
+                                 , month(timestamp) %in% 7:9 ~ "Summer"
+                                 , TRUE ~ "Autumn"
+                                 )
+                       , levels = c("Winter"
+                                    , "Spring"
+                                    , "Summer"
+                                    , "Autumn"
+                                    )
+                       , ordered = TRUE
+                       )
+    ]
+validation[, season := factor(case_when(month(timestamp) %in% 1:3 ~ "Winter"
+                                        , month(timestamp) %in% 4:6 ~ "Spring"
+                                        , month(timestamp) %in% 7:9 ~ "Summer"
+                                        , TRUE ~ "Autumn"
+                                        )
+                              , levels = c("Winter"
+                                           , "Spring"
+                                           , "Summer"
+                                           , "Autumn"
+                                           )
+                              , ordered = TRUE
+                              )
+           ]
+
+# Calculate average review per season
+avg_review_per_season <- edx[, .(rating = mean(rating)
+                                 )
+                             , by = .(season = season
+                                      )
+                             ] [order(season)
+                                ] %>%
+  pivot_wider(names_from = season
+              , values_from = rating
+              )
+
+# Average rating per season and year zoomed in on the y-axis
+rating_time_season_zoom <- edx[, .(Rating = mean(rating)
+                                   , num_ratings = .N
+                                   )
+                               , keyby = .(Year = year(timestamp)
+                                           , Season = season
+                                           )
+                               ] [num_ratings >= 10
+                                  ] %>%
+  ggplot(aes(x = Year
+             , y = Rating
+             , color = Season
+             )
+         ) +
+  geom_line(size = 1.2
+            ) +
+  scale_color_discrete() +
+  scale_x_continuous(n.breaks = 8
+                     ) +
+  ggtitle("Zoomed") +
+  guides(x = guide_axis(angle = 45)
+         )
+# Zooming out on the y-axis for season and year
+rating_time_season_full <- rating_time_season_zoom +
+  scale_y_continuous(limits = c(0
+                                ,5
+                                )
+                     ) +
+  ggtitle("Full y-range")
+
+# Winter 1996 data
+spike_winter_96 <- edx[year(timestamp) == 1996
+                       & season == "Winter"
+                       , .(rating = mean(rating)
+                           , n = .N
+                           )
+                       , by = .(title
+                                )
+                       ] [order(desc(n))
+                          ] %>% top_n(5
+                                      , n
+                                      ) %>%
+  select(Title = title
+         , Reviews = n
+         , Rating = rating
+         )
+
+# Does the year and week a review is given in affect the average?
+effect_of_week_of_review <- edx[, .(rating = mean(rating)
+                                    , number = .N
+                                    )
+                                , by = .(week
+                                         )
+                                ]  %>%
+  ggplot(aes(x = week
+             , y = rating
+             , size = number
+             , alpha = .3
+             )
+         ) +
+  geom_point(shape = 1) +
+  scale_y_continuous(limits = c(0, 5)
+                     ) +
+  scale_x_discrete(breaks = as.character(seq(edx[, min(week)]
+                                             , edx[, max(week)]
+                                             , 10
+                                             )
+                                         )
+                   , labels = as.character(seq(edx[, min(week)]
+                                             , edx[, max(week)]
+                                             , 10
+                                             )
+                                         ) %>% (
+                                           function(x){
+                                             paste0(str_sub(x, 1, 4)
+                                                    , "-"
+                                                    , str_sub(x, 5, 6)
+                                                    )
+                                             }
+                                           )(.) # this is to pass the argument from the pipe to the function
+                   ) +
+  scale_size_continuous(labels = comma) +
+  labs(x = "Year-week"
+       , y = "Avg. Rating"
+       , size = "Number of reviews"
+       , title = "Effect of week of year on ratings"
+       ) +
+  theme(axis.text.x = element_text(angle = 45
+                                   , vjust = 0.2
+                                   )
+        , legend.position = "top"
+        ) +
+  guides(alpha = "none")
+
+# Aggregate by releaseyear to facilitate plotting
+release_year <- edx[, .(rating = mean(rating)
+                        , num_reviews = .N)
+                    , by = .(release_year)
+                    ] %>%
+  mutate(smooth = loess(formula = rating ~ release_year
+                        , data = edx[, .(rating = mean(rating))
+                                     , by = .(release_year)
+                                     ]
+                        ) %>%
+           predict()
+         )
+
+# Does the year a movie was released affect it's average rating?
+effect_of_release_year_on_average <- release_year %>%
+  ggplot(aes(x = release_year
+             , y = rating
+             )
+         ) +
+  geom_point() +
+  geom_vline(xintercept = release_year$release_year[which.max(release_year$smooth)]
+             , linetype = "longdash"
+             , color = "green"
+             , size = 1
+             , alpha = 0.5
+             ) +
+  geom_vline(xintercept = 1980
+             , linetype = "longdash"
+             , color = "black"
+             , size = 1
+             , alpha = 0.5
+             ) +
+  geom_vline(xintercept = release_year$release_year[which.min(release_year$smooth)]
+             , linetype = "longdash"
+             , color = "red"
+             , size = 1
+             , alpha = 0.5
+             ) +
+  geom_smooth(method = "loess", formula = y ~ x) +
+  geom_text(data = data.frame(release_year =
+                                c(release_year$release_year[which.max(release_year$smooth)]
+                                  , 1980
+                                  , release_year$release_year[which.min(release_year$smooth)])
+                              , rating = 0.75
+                              , value = c(max(release_year$smooth)
+                                          , release_year[release_year == 1980, smooth]
+                                          , min(release_year$smooth)
+                                          )
+                              )
+            , nudge_x = -6
+            , mapping = aes(label = paste("Year:", release_year, "\nTrend-value:", round(value, 1)))
+            ) +
+  scale_x_continuous(n.breaks = 10) +
+  scale_y_continuous(limits = c(0
+                                , 5
+                                )
+                     ) +
+  labs(x = "Release Year"
+       , y = "Avg. Rating"
+       , title = "Effect of release year on rating"
+       )
+
+# Does how old the movie is at the time of the review affect the average rating?
+effect_of_years_between_review_release_on_average <- edx[, .(rating = mean(rating)
+                                                             , number_reviews = .N
+                                                             )
+                                                         , by = .(years_passed)
+                                                         ] %>%
+  ggplot(aes(x = years_passed
+             , y = rating
+             , size = number_reviews
+             # , shape = 12
+             )) +
+  geom_point(shape = 1) +
+  scale_size_continuous(labels = comma) +
+  scale_y_continuous(limits = c(0,5)) +
+  labs(x = "Years between rating and release"
+       , y = "Avg. Rating"
+       , size = "Number of Reviews"
+       , title = "Effect of movie age on rating"
+       ) +
+  theme(legend.position = "top")
+
+# Create a training and testing set
+set.seed(2021)
+test_index <- createDataPartition(y = edx$rating, p = .2, list = F)
+training_set <- edx[-test_index]
+temp_test <- edx[test_index]
+# Making sure there are no movies or users in the testing set that aren't in the training set
+test_set <- temp_test %>%
+  semi_join(training_set, by = "movieId") %>%
+  semi_join(training_set, by = "userId")
+removed_test <- anti_join(temp_test, test_set)
+training_set <- rbind(training_set, removed_test)
+rm(temp_test, removed_test, test_index)
+
+# calculate overall average
+overall_training_avg <- training_set[, .(overall_training_avg =
+                                           mean(rating)
+                                         )
+                                     ] %>% pull(overall_training_avg)
+# overview_RMSEs <- data.table(Method = "Average only:", RMSE = RMSE(pred = overall_training_avg, obs = test_set[, rating]))
+# overview_RMSEs[, .(Method, RMSE, "Goal met:" = RMSE < target_rmse)]
+
+# Calculate each movie's difference from the overall average and add them to the datasets
+movie_effect_on_avg <- training_set[, .(movie_effect_on_rating =
+                                          mean(rating)
+                                        - overall_training_avg
+                                        )
+                                    , by = .(MID)
+                                    ]
+training_set <- movie_effect_on_avg[training_set
+                                    , on = .(MID)
+                                    ]
+test_set <- movie_effect_on_avg[test_set
+                                , on = .(MID)
+                                ]
+
+# predictions <- test_set[, overall_training_avg + movie_effect_on_rating]
+# overview_RMSEs <- rbind(overview_RMSEs, data.table(Method = "Movie effect:", RMSE = RMSE(predictions, test_set$rating)))
+# overview_RMSEs[, .(Method, RMSE, "Goal met:" = RMSE < target_rmse)]
+
+# Calculate each user's difference from the overall average adjusted for movie effect and add them to the datasets
+user_effect_on_avg <- training_set[, .(user_effect_on_rating =
+                                         mean(rating
+                                              - movie_effect_on_rating
+                                              )
+                                       - overall_training_avg
+                                       )
+                                   , by = .(UID)
+                                   ]
+training_set <- user_effect_on_avg[training_set
+                                   , on = .(UID)
+                                   ]
+test_set <- user_effect_on_avg[test_set
+                               , on = .(UID)
+                               ]
+# predictions <- test_set[, pred := overall_training_avg + movie_effect_on_rating + user_effect_on_rating]
+# overview_RMSEs <- rbind(overview_RMSEs, data.table(Method = "User effect:", RMSE = RMSE(predictions$pred, test_set$rating)))
+# overview_RMSEs[, .(Method, RMSE, "Goal met:" = RMSE < target_rmse)]
+
+# Calculate the average for each rating group of 50 ratings received and adjust for movie and user effects then add them to the datasets
+training_set <-  training_set[, .(rating_group = .N %/% 50)
+                              , by = .(MID)
+                              ] [training_set
+                                 , on = .(MID)
+                                 ]
+test_set <- training_set[, .(rating_group = .N %/% 50)
+                         , by = .(MID)
+                         ] [test_set
+                            , on = .(MID)
+                            ]
+
+rating_group_effect_on_avg <- training_set[, .(rating_group_effect_on_rating =
+                                                 mean(rating
+                                                      - movie_effect_on_rating
+                                                      - user_effect_on_rating
+                                                      )
+                                               - overall_training_avg
+                                               )
+                                           , by = .(rating_group)
+                                           ]
+
+training_set <- rating_group_effect_on_avg[training_set
+                                           , on = .(rating_group)
+                                           ]
+test_set <- rating_group_effect_on_avg[test_set
+                                       , on = .(rating_group)
+                                       ]
+
+# Calculate each genre's difference from the overall average adjusted for movie and user effect and add them to the datasets
+genre_effect_on_avg <- training_set[, .(genre_effect_on_rating =
+                                          mean(rating
+                                               - movie_effect_on_rating
+                                               - user_effect_on_rating
+                                               - rating_group_effect_on_rating
+                                               )
+                                        - overall_training_avg
+                                        )
+                                    , by = .(genres)
+                                    ]
+training_set <- genre_effect_on_avg[training_set
+                                    , on = .(genres)
+                                    ]
+test_set <- genre_effect_on_avg[test_set
+                                , on = .(genres)
+                                ]
+# predictions <- test_set[, pred := overall_training_avg + movie_effect_on_rating + user_effect_on_rating + genre_effect_on_rating]
+# overview_RMSEs <- rbind(overview_RMSEs, data.table(Method = "Genre effect:", RMSE = RMSE(predictions$pred, test_set$rating)))
+# overview_RMSEs[, .(Method, RMSE, "Goal met:" = RMSE < target_rmse)]
+
+# Calculate each week's difference from the overall average adjusted for movie, user and genre effect and add them to the datasets
+week_effect_on_avg <- training_set[, .(week_effect_on_rating =
+                                         mean(rating
+                                              - movie_effect_on_rating
+                                              - user_effect_on_rating
+                                              - rating_group_effect_on_rating
+                                              - genre_effect_on_rating
+                                              )
+                                       - overall_training_avg
+                                       )
+                                   , by = .(week)
+                                   ]
+training_set <- week_effect_on_avg[training_set
+                                   , on = .(week)
+                                   ]
+test_set <- week_effect_on_avg[test_set
+                               , on = .(week)
+                               ]
+
+# Calculate effect of release year of movie while adjusting for previous factors
+release_year_effect_on_avg <- training_set[, .(release_year_effect_on_rating =
+                                                 mean(rating
+                                                      - movie_effect_on_rating
+                                                      - user_effect_on_rating
+                                                      - rating_group_effect_on_rating
+                                                      - genre_effect_on_rating
+                                                      - week_effect_on_rating
+                                                      )
+                                               - overall_training_avg
+                                               )
+                                           , by = .(release_year)
+                                           ]
+training_set <- release_year_effect_on_avg[training_set
+                                           , on = .(release_year)
+                                           ]
+test_set <- release_year_effect_on_avg[test_set
+                                       , on = .(release_year)
+                                       ]
+
+# Calculate effect of age of movie at time of review while adjusting for previous factors
+age_effect_on_avg <- training_set[, .(age_effect_on_rating =
+                                        mean(rating
+                                             - movie_effect_on_rating
+                                             - user_effect_on_rating
+                                             - rating_group_effect_on_rating
+                                             - genre_effect_on_rating
+                                             - week_effect_on_rating
+                                             - release_year_effect_on_rating
+                                             )
+                                      - overall_training_avg
+                                      )
+                                  , by = .(years_passed)
+                                  ]
+training_set <- age_effect_on_avg[training_set
+                                  , on = .(years_passed)
+                                  ]
+test_set <- age_effect_on_avg[test_set
+                              , on = .(years_passed)
+                              ]
+
+# Calculate the RMSEs with different factors taken into account:
+# Global Average
+overview_RMSEs <- data.table(Method = "Average only:"
+                             , RMSE = RMSE(pred = overall_training_avg
+                                           , obs = test_set[, rating
+                                                            ]
+                                           )
+                             )
+# Global average and the effect of each movie
+overview_RMSEs <- rbind(overview_RMSEs
+                        , data.table(Method = "Movie effect:"
+                                     , RMSE = RMSE(pred = test_set[, overall_training_avg
+                                                                   + movie_effect_on_rating
+                                                                   ]
+                                                   , obs = test_set[, rating
+                                                                    ]
+                                                   )
+                                     )
+                        )
+# Add the effect of each user
+overview_RMSEs <- rbind(overview_RMSEs
+                        , data.table(Method = "User effect:"
+                                     , RMSE = RMSE(pred = test_set[, overall_training_avg
+                                                                   + movie_effect_on_rating
+                                                                   + user_effect_on_rating
+                                                                   ]
+                                                   , obs = test_set[, rating
+                                                                    ]
+                                                   )
+                                     )
+                        )
+# Add number of ratings
+overview_RMSEs <- rbind(overview_RMSEs
+                        , data.table(Method = "Rating group effect:"
+                                     , RMSE = RMSE(pred = test_set[, overall_training_avg
+                                                                   + movie_effect_on_rating
+                                                                   + user_effect_on_rating
+                                                                   + rating_group_effect_on_rating
+                                                                   ]
+                                                   , obs = test_set[, rating
+                                                                    ]
+                                                   )
+                                     )
+                        )
+# Add movie genre
+overview_RMSEs <- rbind(overview_RMSEs
+                        , data.table(Method = "Genre effect:"
+                                     , RMSE = RMSE(pred = test_set[, overall_training_avg
+                                                                   + movie_effect_on_rating
+                                                                   + user_effect_on_rating
+                                                                   + rating_group_effect_on_rating
+                                                                   + genre_effect_on_rating
+                                                                   ]
+                                                   , obs = test_set[, rating
+                                                                    ]
+                                                   )
+                                     )
+                        )
+# Add week of review
+overview_RMSEs <- rbind(overview_RMSEs
+                        , data.table(Method = "Week effect:"
+                                     , RMSE = RMSE(pred = test_set[, overall_training_avg
+                                                                   + movie_effect_on_rating
+                                                                   + user_effect_on_rating
+                                                                   + rating_group_effect_on_rating
+                                                                   + genre_effect_on_rating
+                                                                   + week_effect_on_rating
+                                                                   ]
+                                                   , obs = test_set[, rating
+                                                                    ]
+                                                   )
+                                     )
+                        )
+# Add release year
+overview_RMSEs <- rbind(overview_RMSEs
+                        , data.table(Method = "Release year effect:"
+                                     , RMSE = RMSE(pred = test_set[, overall_training_avg
+                                                                   + movie_effect_on_rating
+                                                                   + user_effect_on_rating
+                                                                   + rating_group_effect_on_rating
+                                                                   + genre_effect_on_rating
+                                                                   + week_effect_on_rating
+                                                                   + release_year_effect_on_rating
+                                                                   ]
+                                                   , obs = test_set[, rating
+                                                                    ]
+                                                   )
+                                     )
+                        )
+# Add age of movie at time of review
+overview_RMSEs <- rbind(overview_RMSEs
+                        , data.table(Method = "Age of movie effect:"
+                                     , RMSE = RMSE(pred = test_set[, overall_training_avg
+                                                                   + movie_effect_on_rating
+                                                                   + user_effect_on_rating
+                                                                   + rating_group_effect_on_rating
+                                                                   + genre_effect_on_rating
+                                                                   + week_effect_on_rating
+                                                                   + release_year_effect_on_rating
+                                                                   + age_effect_on_rating
+                                                                   ]
+                                                   , obs = test_set[, rating
+                                                                    ]
+                                                   )
+                                     )
+                        )
+# Add column to check results
+overview_RMSEs[, "Goal met:" := RMSE < target_rmse]
+
+# initialize setup with number of logical cores and populate training and testing matrices
+threads <- detectCores()
+Y_train <- sparseMatrix(i = training_set[, UID], j = training_set[, MID], x = training_set[, rating], repr = "T")
+Y_test <- sparseMatrix(i = test_set[, UID], j = test_set[, MID], x = test_set[, rating], repr = "T")
+
+# Create the reco object
+r <- Reco()
+
+# Untuned recosystem still beats our target RMSE of 0.8649
+# Train the model with default options:
+opts <- list(nthreads = threads)
+r$train(train_data = data_matrix(Y_train), opts = opts)
+# Predict with default options
+preds <- r$predict(test_data = data_matrix(Y_test), out_pred = out_memory())
+rmse_default <- RMSE(preds, Y_test@x)
+
+# Recosystem comes with default tuning parameters,
+# tune with the number of cores detected and default options takes a long time and finds these options:
+# Uncomment to use pre-found options
+opts <- list(dim = 20, costp_l1 = 0, costp_l2 = 0.01, costq_l1 = 0, costq_l2 = 0.1, lrate = 0.1, nthreads = threads)
+# Uncomment to find options yourself
+# opts <- r$tune(train_data = data_matrix(Y_train), opts = list(nthreads = threads))
+
+# Train model with the tuned options
+r$train(train_data = data_matrix(Y_train), opts = opts)
+# Predict results with the trained model
+preds <- r$predict(test_data = data_matrix(Y_test), out_pred = out_memory())
+rmse_default_tune <- RMSE(preds, Y_test@x)
+
+# Finding the ideal options involves giving fairly large ranges for each option
+# then running large and time consuming crossvalidation tuning runs I found these options after several hours
+# but they can still be improved, but the modest improvement from default tune seems not worth it to put more time in for now
+opts <- list(dim = 33, costp_l1 = 0, costp_l2 = 0.013, costq_l1 = 0, costq_l2 = 0.11, lrate = 0.11, nthreads = threads, niter = 30)
+r$train(train_data = data_matrix(Y_train), opts = opts)
+preds <- r$predict(test_data = data_matrix(Y_test), out_pred = out_memory())
+rmse_optimal_tune <- RMSE(preds, Y_test@x)
+
+# Final run on whole working set with optimal parameters
+Y_final_train <- sparseMatrix(i = edx[, UID], j = edx[, MID], x = edx[, rating], repr = "T")
+Y_final_validation <- sparseMatrix(i = validation[, UID], j = validation[, MID], x = validation[, rating], repr = "T")
+r$train(train_data = data_matrix(Y_final_train), opts = opts)
+preds <- r$predict(test_data = data_matrix(Y_final_validation), out_pred = out_memory())
+rmse_final <- RMSE(preds, Y_final_validation@x)
+```
+
+```{r edit.parts, echo=FALSE}
+
+```
+
+```{r Init, include=FALSE}
+source("Script.R")
+```
+
+# Summary
+
+The Movielens database contains millions of user reviews of movies. These reviews contain information about what genre a movie is classified as, when the review was submitted and what rating from 1-5 the user gave the movie as well as the year a movie was released. I've been asked to predict how users will rate movies they haven't seen based on how they have rated movies they have seen. To succeed in this project my prediction should have an RMSE (Root Mean Squared Error) of less than $`r format(target_rmse, nsmall = 5)`$.
+
+## Workflow
+
+I explored the data provided to look for connections and relationships in the data. Next I evaluated which approaches I could try, mainly resulting in not trying "traditional" Machine Learning algorithms. For example Linear Regression can be bogged down by the sheer quantity of data in this dataset. Finally I tried three different approaches to predict how people would rate movies:
+
+1)  Naive approach:
+    a)  start with predicting the overall average
+    b)  then try the average for each movie
+    c)  adjust further with other factors to arrive at a final model.
+2)  Try to create a Matrix Factorization algorithm manually in R. I abandoned this as too slow, same as traditional Machine Learning, as for example one gradient descent step took over 1 hour on my computer and had not completed.
+3)  Use a pre-written R package to achieve sufficient parallelization to make Matrix Factorization viable.
+
+In the end, the approach I chose to accomplish this task was Matrix Factorization, using the package `recosystem`. Using this approach, **I achieved an RMSE of** $\mathbf{`r round(rmse_final, 5)`}$, well below the required $`r format(target_rmse, nsmall = 5)`$.
+
+\newpage
+
+# Exploring the Movielens dataset
+
+## Size of the datasets and complications
+
+I started off reviewing some key statistics about this dataset. The data has been split into two sets, one for training and model evaluation (there are over $`r format((edx[, .N] %/% 10^6) * 10^6, big.mark = ",", scientific = F)`$ reviews in this dataset) and one for final validation (there are $`r format(validation[, .N], big.mark = ",", scientific = F)`$ reviews in this dataset). There is a total of $`r format(n_users, big.mark = ",")`$ unique users and $`r format(n_movies, big.mark = ",")`$ unique movies. These numbers made me worried about traditional Machine Learning approaches on my home computer as this might be outside of it's capacity.
+
+### Sparsity of data
+
+Even with this large number of reviews the total number of possible reviews is $\text{users} \times \text{movies} = `r format(n_users * n_movies, big.mark = ",")`$ and thus there is a sparsity in a $\text{users} \times \text{movies}$ matrix of $`r round(sparsity * 100, 2)`\%$ ($`r round(sparsity * 100, 2)`\%$ of possible reviews are in the dataset) which means it's also hard to generalize trends that are valid for the unknown values using traditional Machine Learning methods.
+
+For the rest of this section on exploring the dataset the exploration is done only on the training set of data.
+
+## Distribution of ratings
+
+Taking a look at how the different ratings are distributed with a histogram counting how many million times each rating has been given as a review:
+
+```{r ratings-distribution, echo=FALSE}
+distribution_ratings
+```
+
+Immediately a couple of things are visible, half-point reviews like $\{0.5, 1.5, 2.5, 3.5, 4.5\}$ are far less common than the whole-point reviews $\{1,2,3,4,5\}$, also high ratings are more common than low with a mean for the whole dataset of $`r round(edx[, mean(rating)], 2)`$ which is $`r round((edx[, mean(rating)] - median(seq(edx[, min(rating)], edx[, max(rating)], 0.5))) / median(seq(edx[, min(rating)], edx[, max(rating)], 0.5)) * 100, 1)`\%$ more than the median of the possible ratings, $`r median(seq(edx[, min(rating)], edx[, max(rating)], 0.5))`$.
+
+\newpage
+
+## The effect of the numbers of reviews on averages
+
+### Highest and lowest rated movies
+
+Looking at the highest rated movies I found several movies with $1$ or $2$ reviews getting an average rating of $5$, if I filter out movies with less than 10 ratings the top 5 movies sorted by average rating are:
+
+```{r top-movies, echo=FALSE}
+table_style(top_5_movies)
+```
+
+and the bottom 5 movies are:
+
+```{r bottom-movies, echo=FALSE}
+table_style(bottom_5_movies)
+```
+
+As suspected from the distribution of ratings the highest rated movies have a lot more reviews than the lowest rated movies, this makes it interesting to see if the amount of reviews affect the average rating across the whole dataset.
+
+### Users with the highest and lowest average rating
+
+Looking at the users with the highest average rating I found that there are several users who have only given $5$s to movies,
+
+```{r top-users, echo=FALSE}
+table_style(top_5_users[1:5])
+```
+
+and users giving only $0.5$s to movies have reviewed a similar amount of movies:
+
+```{r bottom-users, echo=FALSE}
+table_style(bottom_5_users)
+```
+
+Both of these amounts are small compared to the large number of reviews in the dataset so it seems user review habits affect the average rating less than the movie's average.
+
+\newpage
+
+## Ratings as a function of number of reviews
+
+Looking at average rating as a simple function of number of reviews there does appear to be a trend, but the graphs with this many datapoints are quite hard to read and heavy computationally. To make it a bit easier to read the graphs and also to make the computations faster, I created groups of movies and users for every $50$ reviews received or given, naturally the groups with fewer reviews will have more members than the groups with more reviews. Interestingly there are opposing trends in these two perspectives on reviews. Movies who receive more reviews receive higher ratings, while users who give more reviews give lower rating up to a certain point where this trend flattens out a bit above a rating of $3$.
+
+```{r review-numbers, echo=FALSE}
+effect_of_number_of_ratings_per_movie +
+  effect_of_number_of_ratings_per_user +
+  plot_annotation(title = "Comparison of users and movies by amount of reviews")
+```
+
+\newpage
+
+## Effects of genre on ratings
+
+There are over $700$ different "Genres" in this dataset, created from keywords like "Drama" and "Comedy" in different combinations. Some genres have as few as $2$ reviews or $1$ movie others have over $700,000$ reviews and over $1000$ movies. Overall there is a wide spread of average ratings received depending on which specific genre a movie belongs to. Here's a barplot of the genres arranged by average rating from smallest to largest with $13$ examples displayed to show the spread in average ratings.
+
+```{r echo=FALSE}
+effect_of_genre_on_ratings
+```
+
+As seen here the lowest rated genre received an average rating around $1.5$ while the highest rated genre has an average over $4$. Considering how spread out major genres appear to be using information about other movies in a genre should help give an indication of trends for a movie.
+
+\newpage
+
+## Effects of time on ratings
+
+The Movielens dataset contains the release year of the movie as part of the title field as well as the date and time of the review as a timestamp. From these I've created some time-related fields to evaluate which if any might be interesting to look at.
+
+### Seasonal reviews
+
+Classifying months $1 \to 3$ as Winter, $4 \to 6$ as Spring, $7 \to 9$ as Summer and $10 \to 12$ as Autumn gives us a seasonal information about the reviews. There appears to be hardly any difference between the seasons, so unfortunately no easy wins like people give lower reviews in winter when they're more blue because of the season.
+
+```{r seasons, echo=FALSE}
+table_style(avg_review_per_season, min_two = T)
+```
+
+### Year and season of review
+
+While there doesn't seem to be much seasonal variance, it does appear like there is a small drop in reviews over time indicating that maybe newer movies receive lower reviews than older, but this is a very slight effect that is only visible when one zooms in on the graph:
+
+```{r season-year, echo=FALSE, fig.height=5}
+rating_time_season_full +
+  rating_time_season_zoom +
+  plot_layout(guides = "collect"
+              ) & theme(legend.position = "bottom"
+                        )
+```
+
+\newpage
+
+#### Winter 1996
+
+The spike in ratings in Winter 1996 is due to very few reviews being given to the movies reviewed in that time period, probably this is when the reviews for the dataset first started being collected. The movies with the most reviews in this period and their average ratings are:
+
+```{r echo=FALSE}
+table_style(spike_winter_96)
+```
+
+### Week of review
+
+A more fine grained inspection of the seasonal trend by looking at the week of each year reveals that the time of year really does not appear to have any significant impact on the average review given, maybe this could be made more useful if it could be combined with at least which hemisphere a review comes from since I don't know if for example Australian user reviews will cancel out with Canadian reviews due to being seasonal opposites.
+
+```{r echo=FALSE}
+effect_of_week_of_review
+```
+
+As seen here there's, apart from a few outliers, little variation away from $3.5$ for any random week selected in the range of our dataset.
+
+\newpage
+
+### Release year
+
+Since there appears to possibly be a trend that newer movies receive lower ratings than older I looked at the release year of movies next. There is a slight rising trend in the reviews based on movie release year up until $1943$ when the average rating seems to taper off and movies from $1980$ and later are getting a markedly lower average than before $1980$.
+
+```{r echo=FALSE, fig.height=4}
+effect_of_release_year_on_average
+```
+
+### Age of movie when reviewed
+
+When looking at the time between reviews and the movie's release it seems that most reviews come in the first few years after release, but there's a slight upward trend in ratings given as the years go by.
+
+```{r year, echo=FALSE, fig.height=3.5}
+effect_of_years_between_review_release_on_average
+```
+
+While this increase is modest, and in part can be explained by movies being released before the debut of collecting reviews, it is quite a bit more significant than for example the season when a review was given.
+
+\newpage
+
+# Predicting reviews - results
+
+From the instructions for this project I've received two datasets, one intended purely for final validation and one for working with my model. To be able to perform intermediate evaluation of a model's performance I've split the working dataset into a training set ($80\%$ of the working set) and a test set ($20\%$ of the working set).
+
+## Building a simple model based on training data
+
+### Guessing every review is the global average
+
+I start predicting scores in a simple and "naive" way by predicting that all reviews are equal to the average review over the whole training dataset: $`r round(edx[, mean(rating)], 2)`$ this gives me a pretty large RMSE of $`r round(RMSE(training_set[, mean(rating)], test_set$rating), 5)`$ which is significantly above the goal of $`r format(target_rmse, nsmall = 5)`$.
+
+```{r echo=FALSE}
+table_style(overview_RMSEs[1], results = T)
+```
+
+### Guessing every review is each movie's average rating
+
+My next attempt is to predict that each review is equal to the individual movie's average and this gets me closer:
+
+```{r echo=FALSE}
+table_style(overview_RMSEs[1:2], results = T)
+```
+
+### Taking into account the individual user's average
+
+I expand on this method by taking into account the effect of each user on my predictions thus having my first full matrix of $\text{users} \times \text{movies}$ populated with individual predictions and this gets pretty close to the target of $`r format(target_rmse, nsmall = 5)`$:
+
+```{r echo=FALSE}
+table_style(overview_RMSEs[1:3], results = T)
+```
+
+\newpage
+
+### Additional effects
+
+From my exploratory data analysis I know there are a number of other factors that can have fairly large effect on the final average rating of a movie I'll populate our table with some of them now:
+
+**Number of ratings**
+
+```{r echo=FALSE}
+table_style(overview_RMSEs[1:4], results = T)
+```
+
+**Movie genre**
+
+```{r echo=FALSE}
+table_style(overview_RMSEs[1:5], results = T)
+```
+
+**Week of review**
+
+```{r echo=FALSE}
+table_style(overview_RMSEs[1:6], results = T)
+```
+
+**Release year**
+
+```{r echo=FALSE}
+table_style(overview_RMSEs[1:7], results = T)
+```
+
+\newpage
+
+**Age of movie at time of review**
+
+```{r echo=FALSE}
+table_style(overview_RMSEs[1:8], results = T)
+```
+
+#### Review of results
+
+After all this work I'm seeing very modest improvements for each factor added, while close to the target RMSE of $`r target_rmse`$ the results are not quite there. It might be time to re-evaluate the approach to this problem.
+
+## Matrix factorization
+
+### Why change approach
+
+In my naive approach I tried to account for all the factors found in the data and adjust predictions based on their impact on reviews. What I've not accounted for are unseen factors like a movie's director, the actors etc. For example someone who is a big fan of Tarantino might give all Tarantino movies a review of 5 based on that alone. This type of information is not apparent or exploitable in the naive approach. Matrix factorization tries to discover unseen factors like these to account for variations in the data. Programming a matrix factorization algorithm in R is not very easy as it requires intense use of multiple cores to do effectively, so I've chosen to use the package `recosystem` that is written in C for this.
+
+### Brief simplified theory
+
+Matrix factorization works by considering that the combination of users and movies form a matrix with one row for every user and one column for every movie (or vice versa). This matrix will be mostly empty because each user have seen only a small selection of the movies. In the context of this project the intention is to replace all the empty fields with a prediction for how each user will rate a movie they haven't seen. To do this the $\text{users} \times \text{movies}$ matrix is considered to be a matrix product of two unknown matrices that are $\text{users} \times \text{hidden factors}$ and $\text{hidden factors} \times \text{movies}$. The number of hidden factors is somewhat arbitrary and becomes a parameter that can be tuned to obtain the best results.
+
+Possible reviews by users in rows and movies in columns, empty fields are represented by zeroes:
+
+$$
+\begin{pmatrix}
+1 & 5 & 0 & \ldots & 0 & 3\\
+0 & 5 & 0 & \ldots & 0 & 0\\
+\vdots & \vdots & \vdots & \ddots & \vdots & \vdots \\
+2 & 0 & 1 & \ldots & 4 & 0
+\end{pmatrix}
+$$
+
+Users and two hidden factors could for example be represented like this:
+
+$$
+\begin{pmatrix}1 & 0.5 \\
+3 & 1.6 \\
+\vdots & \vdots \\
+2 & 0.2 
+\end{pmatrix}
+$$
+
+And two hidden factors and movies like this:
+
+$$
+\begin{pmatrix}3 & 2 & \ldots & 1\\
+0.78 & 1.64 & \ldots & 0.43
+\end{pmatrix}
+$$
+
+The matrix product of these two matrices would be the prediction for the full matrix of $\text{users} \times \text{movies}$ to use to for example recommend movies with a high predicted rating to the user as something they might like.
+
+The way this matrix is populated is done like this:
+
+1.  Generating random values for the hidden factors for both users and movies
+2.  Calculate the filled out matrix with predicted values.
+3.  Compare predicted values to the values that exist in the training set
+4.  Consider one of the matrices for example the user matrix "locked"
+5.  Perform a gradient descent step on the other matrix (movie in this example) to move closer towards the correct values
+6.  Calculate a new $\text{hidden factors} \times \text{movies}$ matrix.
+7.  Repeat from $3$ but swap which of the two matrices is kept unmodified
+8.  Repeat $3-7$ until convergence.
+
+### Recosystem results
+
+Even with default options `recosystem` produces an RMSE of $`r round(rmse_default, 5)`$ which is quite well below the required $`r format(target_rmse, nsmall = 5)`$, if the algorithm is tuned that can be improved by a fairly large amount, but this tuning process takes time to run (several hours on my computer).
+
+### Tuning parameters
+
+#### Default options
+
+Recosystem comes with two good default choices for each of the options that can be tuned, there are $6$ of these options giving $2^6 = 64$ combinations, this takes a fair amount of time to run through. After running the $64$ combinations the default tuned parameters of `recosystem` gives an RMSE of $`r round(rmse_default_tune,5)`$.
+
+#### Custom tuning
+
+Each of the $6$ options can be given ranges to fine tune the performance, but as each change to one parameter can cause the ideal choice for another to change this can be very time consuming. I spent a few hours tuning this with moderate improvements at best over the default tuning, but after running the tuning process to have a final list of parameters I achieved an RMSE of $`r round(rmse_optimal_tune, 5)`$ on the test set. Since that is quite well below the target I re-train the model using the parameters I found using the full working dataset to train and then run a final validation on the validation dataset set aside for this.
+
+### Final run
+
+Finally after all the hard work I've trained my model with $`r format(nrow(edx), big.mark = ",", scientific = F)`$ datapoints, and achieved a final RMSE of $`r round(rmse_final, 5)`$ on the $`r format(nrow(validation), big.mark = ",", scientific = F)`$ datapoints in the validation set. I can now recommend new movies to users based on their history of reviews with a high degree of confidence.
+
+\newpage
+
+# Conclusion
+
+There are many factors that can impact a prediction of a review from a given user on any movie, I've explored some of them in this report. The achieved RMSE of $`r round(rmse_final, 5)`$ is quite respectable and is a good result.
+
+## Next steps
+
+To further improve the on this I might try other Matrix Factorization packages, but I would also have liked to try a Neural Net on this task. Unfortunately my laptop isn't equipped with an nVidia GPU and that makes Neural Nets quite a bit slower to use for large matrix calculations, but in future that's a possibly strong contender for this type of prediction.
